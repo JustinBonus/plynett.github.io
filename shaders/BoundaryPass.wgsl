@@ -36,6 +36,9 @@ struct Globals {
 @group(0) @binding(5) var txNewState: texture_storage_2d<rgba32float, write>;
 @group(0) @binding(6) var txNewState_Sed: texture_storage_2d<rgba32float, write>;
 
+@group(0) @binding(7) var txBreaking: texture_2d<f32>;
+@group(0) @binding(8) var txtemp_Breaking: texture_storage_2d<rgba32float, write>;
+
 fn WestBoundarySolid(idx: vec2<i32>) -> vec4<f32> {
     let real_idx = vec2<i32>(globals.boundary_shift  - idx.x, idx.y); 
     let in_state_real = textureLoad(txState, real_idx, 0);
@@ -110,15 +113,30 @@ fn SolitaryWave(idx: vec2<i32>, x0: f32, y0: f32, theta: f32) -> vec4<f32> {
     return vec4<f32>(eta, hu, hv, 0.0);
 }
 
-fn sineWave(x: f32, y: f32, t: f32, d: f32, amplitude: f32, period: f32, theta: f32, phase: f32) -> vec3<f32> {
+fn sineWave(x: f32, y: f32, t: f32, d: f32, amplitude: f32, period: f32, theta: f32, phase: f32, current_boundary: i32) -> vec3<f32> {
     let omega = 2.0 * globals.PI / period;
     let k = calc_wavenumber_approx(omega, d);
     let c = omega / k;
+    let L = 2 * globals.PI / k;
     let theta_mod = theta;
-    let kx = cos(theta_mod) * x * k;
-    let ky = sin(theta_mod) * y * k;
+
+    // modulate the location of the origin slowly in time to reduce the Hs finger effect
+    var yshift= 0.0;
+    var xshift= 0.0;
+    if (current_boundary == 1 || current_boundary == 3) {
+        yshift= 5.0 * L + 0.05 * L * t / period;
+    }
+    if (current_boundary == 2 || current_boundary == 4) {
+        xshift= 5.0 * L + 0.05 * L * t / period;
+    }
+    
+    let kx = cos(theta_mod) * (x + xshift) * k;
+    let ky = sin(theta_mod) * (y + yshift) * k;
     var eta = amplitude * sin(omega * t - kx - ky + phase) * min(1.0, t / period);
-    let num_waves = 0;
+    var num_waves = 0;
+    if (globals.incident_wave_type == 2){ // transient pulse
+        num_waves = 4;
+    }
     if(num_waves > 0){
         eta = eta * max(0.0, min(1.0, ((f32(num_waves) * period - t)/(period))));
     }
@@ -128,17 +146,17 @@ fn sineWave(x: f32, y: f32, t: f32, d: f32, amplitude: f32, period: f32, theta: 
     return vec3<f32>(eta, hu, hv);
 }
 
-fn BoundarySineWave(idx: vec2<i32>) -> vec4<f32> {
+fn BoundarySineWave(idx: vec2<i32>, iBC: i32, jBC: i32, current_boundary: i32) -> vec4<f32> {
     let B_here = -globals.base_depth; //textureLoad(txBottom, idx, 0).b;
     let d_here = max(0.0, -B_here);
-    let x = f32(idx.x) * globals.dx;
-    let y = f32(idx.y) * globals.dy;
+    let x = f32(idx.x - iBC) * globals.dx;
+    let y = f32(idx.y - jBC) * globals.dy;
     var result: vec3<f32> = vec3<f32>(0.0, 0.0, 0.0);
     
     if (d_here > 0.0001) {
         for (var iw: i32 = 0; iw < globals.numberOfWaves; iw = iw + 1) {
             let wave = textureLoad(txWaves, vec2<i32>(iw, 0), 0);
-            result = result + sineWave(x, y, globals.total_time, d_here, wave.r, wave.g, wave.b, wave.a);
+            result = result + sineWave(x, y, globals.total_time, d_here, wave.r, wave.g, wave.b, wave.a, current_boundary);
         }
     }
     return vec4<f32>(result, 0.0);
@@ -149,6 +167,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let idx = vec2<i32>(i32(id.x), i32(id.y));
     var BCState = textureLoad(txState, idx, 0);
     var BCState_Sed = textureLoad(txState_Sed, idx, 0);
+    var BCState_Breaking = textureLoad(txBreaking, idx, 0);
+    let B_here = textureLoad(txBottom, idx, 0).z;
     let zero = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     BCState_Sed = max(BCState_Sed,zero);  // concentration can not go negative
     
@@ -226,7 +246,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // west boundary
     if (globals.west_boundary_type == 2 && idx.x <= 2) {
         if (globals.incident_wave_type <= 2) { // Sine Waves
-            BCState = BoundarySineWave(idx);
+            let iBC = 1;
+            let jBC = 1;
+            let current_boundary = 1;
+            BCState = BoundarySineWave(idx, iBC, jBC, current_boundary);
             BCState_Sed = zero;
         } else if (globals.incident_wave_type == 3) {  // solitary wave
             let x0 = -10.0 * globals.base_depth;
@@ -240,7 +263,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // east boundary
     if (globals.east_boundary_type == 2 && idx.x >= globals.width - 3) {
         if (globals.incident_wave_type <= 2) { // Sine Waves
-            BCState = BoundarySineWave(idx);
+            let iBC = globals.width - 2;
+            let jBC = 1;
+            let current_boundary = 3;
+            BCState = BoundarySineWave(idx, iBC, jBC, current_boundary);
             BCState_Sed = zero;
         } else if (globals.incident_wave_type == 3) {  // solitary wave
             let x0 = f32(globals.width) * globals.dx + 10.0 * globals.base_depth;
@@ -254,7 +280,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // south boundary
     if (globals.south_boundary_type == 2 && idx.y <= 2) {
         if (globals.incident_wave_type <= 2) { // Sine Waves
-            BCState = BoundarySineWave(idx);
+            let iBC = 1;
+            let jBC = 1;
+            let current_boundary = 2;
+            BCState = BoundarySineWave(idx, iBC, jBC, current_boundary);
             BCState_Sed = zero;
         } else if (globals.incident_wave_type == 3) {  // solitary wave
             let x0 = 0.0;
@@ -268,7 +297,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // north boundary
     if (globals.north_boundary_type == 2 && idx.y >= globals.height - 3) {
         if (globals.incident_wave_type <= 2) { // Sine Waves
-            BCState = BoundarySineWave(idx);
+            let iBC = 1;
+            let jBC = globals.height - 2;
+            let current_boundary = 4;
+            BCState = BoundarySineWave(idx, iBC, jBC, current_boundary);
             BCState_Sed = zero;
         } else if (globals.incident_wave_type == 3) {  // solitary wave
             let x0 = 0.0;
@@ -281,43 +313,104 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Periodic boundary conditions
     // west boundary
-    if (globals.west_boundary_type == 3 && idx.x <= 2) {
-        let idx_east = vec2<i32>(globals.width - (6 - idx.x), idx.y);
-        BCState = textureLoad(txState, idx_east, 0);
+    if (globals.west_boundary_type == 3) {
+        if (idx.x <= 1) {
+            let idx_east = vec2<i32>(globals.width - (6 - idx.x), idx.y);
+            BCState = textureLoad(txState, idx_east, 0);
+            BCState_Sed = textureLoad(txState_Sed, idx_east, 0);
+            BCState_Breaking = textureLoad(txBreaking, idx_east, 0);
+        }
     }
 
     // east boundary
-    if (globals.east_boundary_type == 3 && idx.x >= globals.width - 3) {
-        let idx_west = vec2<i32>(idx.x + 6 - globals.width, idx.y);
-        BCState = textureLoad(txState, idx_west, 0);
-    }  
+    if (globals.east_boundary_type == 3) {
+        if (idx.x >= globals.width - 2) {
+            let idx_west = vec2<i32>(idx.x + 6 - globals.width, idx.y);
+            BCState = textureLoad(txState, idx_west, 0);
+            BCState_Sed = textureLoad(txState_Sed, idx_west, 0);
+            BCState_Breaking = textureLoad(txBreaking, idx_west, 0);
+        }
+    }
 
     // south boundary
-    if (globals.south_boundary_type == 3 && idx.y <= 2) {
-        let idx_north = vec2<i32>(idx.x, globals.height - (6 - idx.y));
+    if (globals.south_boundary_type == 3) {
         if (idx.y <= 1) {
+            let idx_north = vec2<i32>(idx.x, globals.height - (6 - idx.y));
             BCState = textureLoad(txState, idx_north, 0);
-        } else {
-            BCState.z = textureLoad(txState, idx_north, 0).z;
-        }        
+            BCState_Sed = textureLoad(txState_Sed, idx_north, 0);
+            BCState_Breaking = textureLoad(txBreaking, idx_north, 0);
+        }
     }
 
     // north boundary
-    if (globals.north_boundary_type == 3 && idx.y >= globals.height - 3) {
-        let idx_south = vec2<i32>(idx.x, idx.y + 6 - globals.height);
+    if (globals.north_boundary_type == 3) {
         if (idx.y >= globals.height - 2) {
+            let idx_south = vec2<i32>(idx.x, idx.y + 6 - globals.height);
             BCState = textureLoad(txState, idx_south, 0);
-        } else {
-            BCState.z = textureLoad(txState, idx_south, 0).z;
+            BCState_Sed = textureLoad(txState_Sed, idx_south, 0);
+            BCState_Breaking = textureLoad(txBreaking, idx_south, 0);
         }
-    }  
+    }
+
+    // Constant elevation boundary conditions
+    // west boundary
+    var stage_elevation = 0.0;
+    var stage_speed = 0.0;
+    if (globals.incident_wave_type == 10) {  // 10-year flood
+        stage_elevation = 8.2;
+        stage_speed = 1.5;
+    }
+    else if (globals.incident_wave_type == 11) { // 50-year flood
+        stage_elevation = 10.2;
+        stage_speed = 2.;
+    }
+    else if (globals.incident_wave_type == 12) { // 100-yr flood
+        stage_elevation = 10.6;
+        stage_speed = 2.2;
+    }
+    else if (globals.incident_wave_type == 13) {  // 200-yr flood
+        stage_elevation = 11.2;
+        stage_speed = 2.3;
+    }
+    else if (globals.incident_wave_type == 14) {  // 500-yr flood
+        stage_elevation = 11.8;
+        stage_speed = 2.5;
+    }
+
+
+    if (globals.west_boundary_type == 4) {
+        var left_bottom_start = 490.;
+        if (stage_elevation > 10.0) {left_bottom_start = 390.;}
+        if (idx.x <= 1 && f32(idx.y) * globals.dy > left_bottom_start && f32(idx.y) * globals.dy < 600. ) {  //LARIVER MOD
+            let flow_depth = max(stage_elevation - B_here, 0.0);
+            let hu = flow_depth * stage_speed;
+            let hv = 0.0;
+            var conc = 0.0;
+            if (f32(idx.y) * globals.dy > 505 && f32(idx.y) * globals.dy < 570. && i32(globals.total_time / 30.0) % 2 == 0) {conc = 1.0;}
+            BCState = vec4<f32>(stage_elevation, hu, hv, conc);
+            BCState_Sed = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            BCState_Breaking = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+    // east boundary
+    if (globals.east_boundary_type == 4) {
+        if (idx.x >= globals.width - 2 && f32(idx.y) * globals.dy > 575. && f32(idx.y) * globals.dy < 685. ) {  //LARIVER MOD
+            let elev_downstream = stage_elevation - 5.0; 
+            let flow_depth = max(elev_downstream - B_here, 0.0);
+            let hu = flow_depth * stage_speed;
+            let hv = 0.0;
+            BCState = vec4<f32>(elev_downstream , hu, hv, 0.0);
+            BCState_Sed = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            BCState_Breaking = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        }
+    }
+
 
     let leftIdx = idx + vec2<i32>(-1, 0);
     let rightIdx = idx + vec2<i32>(1, 0);
     let downIdx = idx + vec2<i32>(0, -1);
     let upIdx = idx + vec2<i32>(0, 1);
 
-    let B_here = textureLoad(txBottom, idx, 0).z;
     let B_south = textureLoad(txBottom, downIdx, 0).z;
     let B_north = textureLoad(txBottom, upIdx, 0).z;
     let B_west = textureLoad(txBottom, leftIdx, 0).z;
@@ -379,8 +472,13 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let wetdry = min(h_here, min(h_south, min(h_north, min(h_west, h_east))));
     let nearshore = min(B_here, min(B_south, min(B_north, min(B_west, B_east))));
 
+    var boundary_boolean = -1;
+    if (idx.x >= globals.width - 2 || idx.y >= globals.height - 3 || idx.x <= 1 || idx.y <= 3) {
+        boundary_boolean = 1;
+    }
+
     // remove islands
-    if( dry_here == 1) {  // point is wet
+    if( dry_here == 1 && boundary_boolean < 0) {  // point is wet
         if (sum_dry == 0) {  // freeze single point wet areas
             if (B_here <= 0.0) {
                 BCState = vec4<f32>(max(BCState.x,B_here), 0.0, 0.0, 0.0);
@@ -412,4 +510,5 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     textureStore(txNewState, idx, BCState);
     textureStore(txNewState_Sed, idx, BCState_Sed);
+    textureStore(txtemp_Breaking, idx, BCState_Breaking);
 }
